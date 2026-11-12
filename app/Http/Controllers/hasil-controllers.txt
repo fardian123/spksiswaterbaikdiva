@@ -1,0 +1,816 @@
+========== AbsensiController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Siswa;
+use App\Models\Absensi;
+use App\Imports\RangkingImport;
+use Illuminate\Http\Request;
+use Maatwebsite\Excel\Facades\Excel;
+
+class AbsensiController extends Controller
+{
+    /**
+     * Daftar siswa beserta rata-rata persentase kehadirannya (jika ada).
+     */
+    public function index()
+    {
+        $siswa = Siswa::with('absensi')->orderBy('nama')->paginate(15);
+
+        return view('absensi.index', compact('siswa'));
+    }
+
+    /**
+     * Simpan/perbarui absensi secara manual untuk banyak siswa sekaligus.
+     * Form diharapkan mengirim:
+     *   semester = string
+     *   rata_rata[siswa_id] = angka persen
+     */
+    public function storeManual(Request $request)
+    {
+        $validated = $request->validate([
+            'semester'      => 'required|string|max:30',
+            'rata_rata'     => 'required|array',
+            'rata_rata.*'   => 'nullable|numeric|min:0|max:100',
+        ]);
+
+        foreach ($validated['rata_rata'] as $siswaId => $persen) {
+            if ($persen === null || $persen === '') {
+                continue;
+            }
+
+            Absensi::updateOrCreate(
+                ['siswa_id' => $siswaId, 'semester' => $validated['semester']],
+                ['rata_rata_persen' => $persen]
+            );
+        }
+
+        return redirect()->route('absensi.index')
+            ->with('success', 'Data absensi berhasil disimpan.');
+    }
+
+    /**
+     * Import dari file ranking (format seperti Rangking_XI_TE_2_1b_2526_xls.xls)
+     * yang berisi kolom "Rata-rata ABS" dan "Rata-rata NR".
+     *
+     * Catatan: import ini SEKALIGUS mengisi tabel nilai_akademik
+     * (kriteria Akademik), karena kedua data tersebut berasal dari file
+     * yang sama. Lihat App\Imports\RangkingImport.
+     */
+    public function import(Request $request)
+    {
+        $request->validate([
+            'file'     => 'required|mimes:xls,xlsx,csv',
+            'semester' => 'required|string|max:30',
+        ]);
+
+        Excel::import(
+            new RangkingImport($request->input('semester')),
+            $request->file('file')
+        );
+
+        return redirect()->route('absensi.index')
+            ->with('success', 'Import data absensi & nilai akademik berhasil.');
+    }
+}
+
+========== Controller.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Foundation\Validation\ValidatesRequests;
+use Illuminate\Routing\Controller as BaseController;
+
+class Controller extends BaseController
+{
+    use AuthorizesRequests, ValidatesRequests;
+}
+
+========== DashboardController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Siswa;
+use App\Models\Mapel;
+use App\Models\HasilSpk;
+
+class DashboardController extends Controller
+{
+    /**
+     * Tampilkan ringkasan data di halaman utama admin.
+     */
+    public function index()
+    {
+        $totalSiswa   = Siswa::count();
+        $totalMapel   = Mapel::count();
+        $belumDikategori = Mapel::whereNull('kategori')->count();
+
+        $totalUmum     = Mapel::where('kategori', 'umum')->count();
+        $totalKejuruan = Mapel::where('kategori', 'kejuruan')->count();
+        $totalKreatif  = Mapel::where('kategori', 'kreatif')->count();
+
+        // Top 5 ranking terakhir (kalau proses SPK sudah pernah dijalankan)
+        $top5 = HasilSpk::with('siswa')
+            ->orderBy('ranking')
+            ->take(5)
+            ->get();
+
+        return view('dashboard', compact(
+            'totalSiswa',
+            'totalMapel',
+            'belumDikategori',
+            'totalUmum',
+            'totalKejuruan',
+            'totalKreatif',
+            'top5'
+        ));
+    }
+}
+
+========== HomeController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+
+class HomeController extends Controller
+{
+    /**
+     * Create a new controller instance.
+     *
+     * @return void
+     */
+    public function __construct()
+    {
+        $this->middleware('auth');
+    }
+
+    /**
+     * Show the application dashboard.
+     *
+     * @return \Illuminate\Contracts\Support\Renderable
+     */
+    public function index()
+    {
+        return view('home');
+    }
+}
+
+========== KriteriaController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Kriteria;
+use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
+
+class KriteriaController extends Controller
+{
+    /**
+     * Tampilkan 5 kriteria beserta bobot & atribut (benefit/cost) masing-masing.
+     */
+    public function index()
+    {
+        $kriteria = Kriteria::orderBy('kode')->get();
+
+        return view('kriteria.index', compact('kriteria'));
+    }
+
+    /**
+     * Perbarui bobot (dan atribut) semua kriteria sekaligus.
+     * Form diharapkan mengirim:
+     *   bobot[kriteria_id] = angka (persen)
+     *   atribut[kriteria_id] = 'benefit' | 'cost'
+     *
+     * Total bobot WAJIB 100, kalau tidak akan ditolak dengan pesan error.
+     */
+    public function updateBobot(Request $request)
+    {
+        $validated = $request->validate([
+            'bobot'         => 'required|array',
+            'bobot.*'       => 'required|numeric|min:0|max:100',
+            'atribut'       => 'required|array',
+            'atribut.*'     => 'required|in:benefit,cost',
+        ]);
+
+        $totalBobot = array_sum($validated['bobot']);
+
+        if (round($totalBobot, 2) != 100) {
+            throw ValidationException::withMessages([
+                'bobot' => "Total bobot harus 100%. Saat ini totalnya {$totalBobot}%.",
+            ]);
+        }
+
+        foreach ($validated['bobot'] as $kriteriaId => $bobot) {
+            Kriteria::where('id', $kriteriaId)->update([
+                'bobot'   => $bobot,
+                'atribut' => $validated['atribut'][$kriteriaId],
+            ]);
+        }
+
+        return redirect()->route('kriteria.index')
+            ->with('success', 'Bobot kriteria berhasil diperbarui.');
+    }
+}
+
+========== MapelController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Mapel;
+use Illuminate\Http\Request;
+
+class MapelController extends Controller
+{
+    /**
+     * Daftar semua mapel, dikelompokkan per kategori.
+     * Mapel yang kategori-nya masih null akan tampil di bagian
+     * "Belum Dikategorikan" agar admin langsung menentukannya.
+     */
+    public function index()
+    {
+        $mapel = Mapel::orderByRaw("kategori IS NULL DESC")
+            ->orderBy('kategori')
+            ->orderBy('nama_mapel')
+            ->get();
+
+        return view('mapel.index', compact('mapel'));
+    }
+
+    /**
+     * Form tambah mapel manual (di luar hasil import excel).
+     */
+    public function create()
+    {
+        return view('mapel.create');
+    }
+
+    /**
+     * Simpan mapel baru secara manual.
+     */
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'kode_mapel'  => 'nullable|string|max:30',
+            'nama_mapel'  => 'required|string|max:150|unique:mapel,nama_mapel',
+            'kategori'    => 'nullable|in:umum,kejuruan,kreatif',
+        ]);
+
+        Mapel::create($validated);
+
+        return redirect()->route('mapel.index')
+            ->with('success', 'Mapel baru berhasil ditambahkan.');
+    }
+
+    /**
+     * Form edit satu mapel (misalnya membenarkan nama yang
+     * terpotong hasil import excel: "Sistem Kendali Elekt" -> lengkap).
+     */
+    public function edit(Mapel $mapel)
+    {
+        return view('mapel.edit', compact('mapel'));
+    }
+
+    public function update(Request $request, Mapel $mapel)
+    {
+        $validated = $request->validate([
+            'kode_mapel'  => 'nullable|string|max:30',
+            'nama_mapel'  => 'required|string|max:150|unique:mapel,nama_mapel,' . $mapel->id,
+            'kategori'    => 'nullable|in:umum,kejuruan,kreatif',
+        ]);
+
+        $mapel->update($validated);
+
+        return redirect()->route('mapel.index')
+            ->with('success', 'Mapel berhasil diperbarui.');
+    }
+
+    public function destroy(Mapel $mapel)
+    {
+        $mapel->delete();
+
+        return redirect()->route('mapel.index')
+            ->with('success', 'Mapel berhasil dihapus.');
+    }
+
+    /**
+     * Simpan kategori untuk banyak mapel sekaligus.
+     * Dipanggil dari form di halaman index yang berisi
+     * select kategori (umum/kejuruan/kreatif) per baris mapel.
+     *
+     * Form view diharapkan mengirim:
+     *   mapel_id[]  = [1, 2, 3, ...]
+     *   kategori[]  = ['umum', 'kejuruan', 'kreatif', ...]
+     * dengan index array yang selaras (mapel_id[0] berpasangan dengan kategori[0]).
+     */
+    public function setKategori(Request $request)
+    {
+        $validated = $request->validate([
+            'mapel_id'   => 'required|array',
+            'mapel_id.*' => 'exists:mapel,id',
+            'kategori'   => 'required|array',
+            'kategori.*' => 'in:umum,kejuruan,kreatif',
+        ]);
+
+        foreach ($validated['mapel_id'] as $index => $mapelId) {
+            Mapel::where('id', $mapelId)->update([
+                'kategori' => $validated['kategori'][$index],
+            ]);
+        }
+
+        return redirect()->route('mapel.index')
+            ->with('success', 'Kategori mapel berhasil disimpan.');
+    }
+}
+========== NilaiAkademikController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Siswa;
+use App\Models\NilaiAkademik;
+use Illuminate\Http\Request;
+
+class NilaiAkademikController extends Controller
+{
+    /**
+     * Daftar siswa beserta nilai rata-rata akademik (kriteria 1) jika ada.
+     * Data ini biasanya sudah otomatis terisi dari import di menu Absensi
+     * (karena satu file excel ranking berisi kolom Rata-rata ABS & Rata-rata NR),
+     * tapi tetap disediakan input manual untuk koreksi/kasus khusus.
+     */
+    public function index()
+    {
+        $siswa = Siswa::with('nilaiAkademik')->orderBy('nama')->paginate(15);
+
+        return view('nilai-akademik.index', compact('siswa'));
+    }
+
+    /**
+     * Simpan/perbarui nilai akademik manual untuk banyak siswa sekaligus.
+     * Form diharapkan mengirim:
+     *   semester = string
+     *   rata_rata_nr[siswa_id] = angka
+     */
+    public function storeManual(Request $request)
+    {
+        $validated = $request->validate([
+            'semester'          => 'required|string|max:30',
+            'rata_rata_nr'      => 'required|array',
+            'rata_rata_nr.*'    => 'nullable|numeric|min:0|max:100',
+        ]);
+
+        foreach ($validated['rata_rata_nr'] as $siswaId => $nilai) {
+            if ($nilai === null || $nilai === '') {
+                continue;
+            }
+
+            NilaiAkademik::updateOrCreate(
+                ['siswa_id' => $siswaId, 'semester' => $validated['semester']],
+                ['rata_rata_nr' => $nilai]
+            );
+        }
+
+        return redirect()->route('nilai-akademik.index')
+            ->with('success', 'Nilai akademik berhasil disimpan.');
+    }
+}
+========== NilaiController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Siswa;
+use App\Models\Mapel;
+use App\Models\NilaiMapel;
+use App\Imports\RekapNilaiImport;
+use Illuminate\Http\Request;
+use Maatwebsite\Excel\Facades\Excel;
+
+class NilaiController extends Controller
+{
+    /**
+     * Daftar siswa, dengan info jumlah mapel yang sudah/belum diisi nilainya.
+     */
+    public function index()
+    {
+        $siswa = Siswa::withCount('nilaiMapel')->orderBy('nama')->paginate(15);
+        $totalMapel = Mapel::count();
+
+        return view('nilai.index', compact('siswa', 'totalMapel'));
+    }
+
+    /**
+     * Form input nilai manual untuk satu siswa: menampilkan semua mapel
+     * (dikelompokkan per kategori) beserta nilai yang sudah ada (jika ada).
+     */
+    public function edit(Siswa $siswa)
+    {
+        $mapelUmum     = Mapel::where('kategori', 'umum')->orderBy('nama_mapel')->get();
+        $mapelKejuruan = Mapel::where('kategori', 'kejuruan')->orderBy('nama_mapel')->get();
+        $mapelKreatif  = Mapel::where('kategori', 'kreatif')->orderBy('nama_mapel')->get();
+
+        // nilai yang sudah ada, di-index by mapel_id supaya gampang dicek di view
+        $nilaiSekarang = NilaiMapel::where('siswa_id', $siswa->id)
+            ->pluck('nilai', 'mapel_id');
+
+        return view('nilai.edit', compact(
+            'siswa', 'mapelUmum', 'mapelKejuruan', 'mapelKreatif', 'nilaiSekarang'
+        ));
+    }
+
+    /**
+     * Simpan nilai manual untuk satu siswa, sekali submit untuk semua mapel.
+     * Form diharapkan mengirim: nilai[mapel_id] = angka, semester = string
+     */
+    public function update(Request $request, Siswa $siswa)
+    {
+        $validated = $request->validate([
+            'semester'    => 'required|string|max:30',
+            'nilai'       => 'required|array',
+            'nilai.*'     => 'nullable|numeric|min:0|max:100',
+        ]);
+
+        foreach ($validated['nilai'] as $mapelId => $nilai) {
+            if ($nilai === null || $nilai === '') {
+                continue;
+            }
+
+            NilaiMapel::updateOrCreate(
+                [
+                    'siswa_id' => $siswa->id,
+                    'mapel_id' => $mapelId,
+                    'semester' => $validated['semester'],
+                ],
+                ['nilai' => $nilai]
+            );
+        }
+
+        return redirect()->route('nilai.index')
+            ->with('success', "Nilai untuk {$siswa->nama} berhasil disimpan.");
+    }
+
+    /**
+     * Import nilai dari file excel rekap nilai (format seperti
+     * rekapnilk3_XI_TE_2_1b_2526.xls).
+     *
+     * Kolom mapel yang belum dikenal otomatis dibuat sebagai Mapel baru
+     * dengan kategori kosong -> admin wajib atur kategorinya di menu Mapel
+     * setelah proses import ini selesai.
+     */
+    public function import(Request $request)
+    {
+        $request->validate([
+            'file'     => 'required|mimes:xls,xlsx,csv',
+            'semester' => 'required|string|max:30',
+        ]);
+
+        Excel::import(
+            new RekapNilaiImport($request->input('semester')),
+            $request->file('file')
+        );
+
+        return redirect()->route('nilai.index')
+            ->with('success', 'Import nilai mapel berhasil. Silakan cek/atur kategori mapel di menu Mapel.');
+    }
+}
+
+========== RangkingImport.php ==========
+<?php
+
+namespace App\Imports;
+
+use App\Models\Siswa;
+use App\Models\Absensi;
+use App\Models\NilaiAkademik;
+use Illuminate\Support\Collection;
+use Maatwebsite\Excel\Concerns\ToCollection;
+use Maatwebsite\Excel\Concerns\WithHeadingRow;
+
+/**
+ * Import untuk file seperti Rangking_XI_TE_2_1b_2526_xls.xls
+ * Kolom: no, nis, nasis (nama siswa), rata_rata_abs, rata_rata_nr, ket
+ *
+ * Satu file ini mengisi DUA tabel sekaligus:
+ * - absensi.rata_rata_persen   (dari kolom Rata-rata ABS)
+ * - nilai_akademik.rata_rata_nr (dari kolom Rata-rata NR)
+ */
+class RangkingImport implements ToCollection, WithHeadingRow
+{
+    protected string $semester;
+
+    public function __construct(string $semester)
+    {
+        $this->semester = $semester;
+    }
+
+    public function collection(Collection $rows)
+    {
+        foreach ($rows as $row) {
+            $nis  = trim((string) ($row['nis'] ?? ''));
+            $nama = trim((string) ($row['nasis'] ?? $row['nama'] ?? ''));
+
+            if ($nis === '' || $nama === '') {
+                continue;
+            }
+
+            $siswa = Siswa::firstOrCreate(
+                ['nis' => $nis],
+                ['nama' => $nama]
+            );
+
+            $rataAbs = $row['rata_rata_abs'] ?? null;
+            $rataNr  = $row['rata_rata_nr'] ?? null;
+
+            if ($rataAbs !== null && $rataAbs !== '') {
+                Absensi::updateOrCreate(
+                    ['siswa_id' => $siswa->id, 'semester' => $this->semester],
+                    ['rata_rata_persen' => (float) $rataAbs]
+                );
+            }
+
+            if ($rataNr !== null && $rataNr !== '') {
+                NilaiAkademik::updateOrCreate(
+                    ['siswa_id' => $siswa->id, 'semester' => $this->semester],
+                    ['rata_rata_nr' => (float) $rataNr]
+                );
+            }
+        }
+    }
+}
+
+========== SiswaController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Siswa;
+use Illuminate\Http\Request;
+
+class SiswaController extends Controller
+{
+    /**
+     * Tampilkan daftar siswa (dengan pencarian sederhana).
+     */
+    public function index(Request $request)
+    {
+        $keyword = $request->get('q');
+
+        $siswa = Siswa::when($keyword, function ($query) use ($keyword) {
+            $query->where('nama', 'like', "%{$keyword}%")
+                ->orWhere('nis', 'like', "%{$keyword}%");
+        })
+            ->orderBy('nama')
+            ->paginate(15);
+
+        return view('siswa.index', compact('siswa', 'keyword'));
+    }
+
+    /**
+     * Form tambah siswa baru.
+     */
+    public function create()
+    {
+        return view('siswa.create');
+    }
+
+    /**
+     * Simpan siswa baru (input manual).
+     */
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'nis' => 'required|string|max:30|unique:siswa,nis',
+            'nama' => 'required|string|max:150',
+            'kelas' => 'nullable|string|max:50',
+            'jurusan' => 'nullable|string|max:100',
+            'tahun_ajaran' => 'nullable|string|max:20',
+        ]);
+
+        Siswa::create($validated);
+
+        return redirect()->route('siswa.index')
+            ->with('success', 'Data siswa berhasil ditambahkan.');
+    }
+
+    /**
+     * Form edit siswa.
+     */
+    public function edit(Siswa $siswa)
+    {
+        return view('siswa.edit', compact('siswa'));
+    }
+
+    /**
+     * Update data siswa.
+     */
+    public function update(Request $request, Siswa $siswa)
+    {
+        $validated = $request->validate([
+            'nis' => 'required|string|max:30|unique:siswa,nis,' . $siswa->id,
+            'nama' => 'required|string|max:150',
+            'kelas' => 'nullable|string|max:50',
+            'jurusan' => 'nullable|string|max:100',
+            'tahun_ajaran' => 'nullable|string|max:20',
+        ]);
+
+        $siswa->update($validated);
+
+        return redirect()->route('siswa.index')
+            ->with('success', 'Data siswa berhasil diperbarui.');
+    }
+
+    /**
+     * Hapus siswa (otomatis ikut menghapus nilai, absensi, dst karena cascade).
+     */
+    public function destroy(Siswa $siswa)
+    {
+        $siswa->delete();
+
+        return redirect()->route('siswa.index')
+            ->with('success', 'Data siswa berhasil dihapus.');
+    }
+}
+
+========== SpkController.php ==========
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Siswa;
+use App\Models\Kriteria;
+use App\Models\HasilSpk;
+use Illuminate\Http\Request;
+use Barryvdh\DomPDF\Facade\Pdf;
+
+class SpkController extends Controller
+{
+    /**
+     * Tampilkan form untuk memulai proses SPK (pilih semester).
+     */
+    public function formProses()
+    {
+        $kriteria = Kriteria::orderBy('kode')->get();
+        $totalBobot = $kriteria->sum('bobot');
+
+        return view('spk.proses', compact('kriteria', 'totalBobot'));
+    }
+
+    /**
+     * Jalankan perhitungan SPK dengan metode SAW (Simple Additive Weighting).
+     *
+     * Semua 5 kriteria bersifat benefit (semakin besar semakin baik):
+     * 1) Akademik        -> dari nilai_akademik.rata_rata_nr
+     * 2) Nilai Umum      -> rata-rata nilai_mapel yang kategori = umum
+     * 3) Nilai Kejuruan  -> rata-rata nilai_mapel yang kategori = kejuruan
+     * 4) Absensi         -> dari absensi.rata_rata_persen
+     * 5) Kreatif         -> rata-rata nilai_mapel yang kategori = kreatif
+     */
+    public function proses(Request $request)
+    {
+        $request->validate([
+            'semester' => 'required|string|max:30',
+        ]);
+
+        $semester = $request->input('semester');
+
+        $kriteria = Kriteria::all()->keyBy('kode');
+        if ($kriteria->sum('bobot') != 100) {
+            return back()->with('error', 'Total bobot kriteria belum 100%. Atur dulu di menu Kriteria.');
+        }
+
+        $siswaSemua = Siswa::with([
+            'nilaiMapel' => function ($q) use ($semester) {
+                $q->where('semester', $semester)->with('mapel');
+            },
+            'absensi' => function ($q) use ($semester) {
+                $q->where('semester', $semester);
+            },
+            'nilaiAkademik' => function ($q) use ($semester) {
+                $q->where('semester', $semester);
+            },
+        ])->get();
+
+        if ($siswaSemua->isEmpty()) {
+            return back()->with('error', 'Belum ada data siswa/nilai untuk semester ini.');
+        }
+
+        // 1) Kumpulkan nilai mentah per kriteria per siswa
+        $dataMentah = [];
+
+        foreach ($siswaSemua as $siswa) {
+            $umum = $siswa->nilaiMapel
+                ->filter(fn ($n) => optional($n->mapel)->kategori === 'umum')
+                ->avg('nilai');
+
+            $kejuruan = $siswa->nilaiMapel
+                ->filter(fn ($n) => optional($n->mapel)->kategori === 'kejuruan')
+                ->avg('nilai');
+
+            $kreatif = $siswa->nilaiMapel
+                ->filter(fn ($n) => optional($n->mapel)->kategori === 'kreatif')
+                ->avg('nilai');
+
+            $akademik = optional($siswa->nilaiAkademik)->rata_rata_nr;
+            $absensiVal = optional($siswa->absensi)->rata_rata_persen;
+
+            $dataMentah[$siswa->id] = [
+                'C1' => (float) ($akademik ?? 0),
+                'C2' => (float) ($umum ?? 0),
+                'C3' => (float) ($kejuruan ?? 0),
+                'C4' => (float) ($absensiVal ?? 0),
+                'C5' => (float) ($kreatif ?? 0),
+            ];
+        }
+
+        // 2) Cari nilai maksimum tiap kolom kriteria (semua kriteria benefit)
+        $nilaiMax = ['C1' => 0, 'C2' => 0, 'C3' => 0, 'C4' => 0, 'C5' => 0];
+        foreach ($dataMentah as $row) {
+            foreach ($nilaiMax as $kode => $nilai) {
+                $nilaiMax[$kode] = max($nilai, $row[$kode]);
+            }
+        }
+
+        // 3) Normalisasi (SAW): rij = xij / max(xij), lalu kalikan bobot, jumlahkan
+        $hasilPerhitungan = [];
+
+        foreach ($dataMentah as $siswaId => $row) {
+            $skor = 0;
+
+            foreach ($row as $kode => $nilai) {
+                $rNormalisasi = $nilaiMax[$kode] > 0 ? ($nilai / $nilaiMax[$kode]) : 0;
+                $bobot = $kriteria[$kode]->bobot / 100;
+                $skor += $rNormalisasi * $bobot;
+            }
+
+            $hasilPerhitungan[$siswaId] = [
+                'nilai' => $row,
+                'skor'  => $skor,
+            ];
+        }
+
+        // 4) Urutkan dari skor tertinggi -> terendah, lalu tetapkan ranking
+        uasort($hasilPerhitungan, fn ($a, $b) => $b['skor'] <=> $a['skor']);
+
+        $ranking = 1;
+        foreach ($hasilPerhitungan as $siswaId => $h) {
+            HasilSpk::updateOrCreate(
+                ['siswa_id' => $siswaId, 'semester' => $semester],
+                [
+                    'nilai_akademik'  => $h['nilai']['C1'],
+                    'nilai_umum'      => $h['nilai']['C2'],
+                    'nilai_kejuruan'  => $h['nilai']['C3'],
+                    'nilai_absensi'   => $h['nilai']['C4'],
+                    'nilai_kreatif'   => $h['nilai']['C5'],
+                    'skor_akhir'      => $h['skor'],
+                    'ranking'         => $ranking,
+                ]
+            );
+            $ranking++;
+        }
+
+        return redirect()->route('spk.hasil', ['semester' => $semester])
+            ->with('success', 'Proses perhitungan SPK selesai.');
+    }
+
+    /**
+     * Tampilkan hasil ranking siswa terbaik untuk semester tertentu.
+     */
+    public function hasil(Request $request)
+    {
+        $semester = $request->query('semester');
+
+        $hasil = HasilSpk::with('siswa')
+            ->when($semester, fn ($q) => $q->where('semester', $semester))
+            ->orderBy('ranking')
+            ->get();
+
+        return view('spk.hasil', compact('hasil', 'semester'));
+    }
+
+    /**
+     * Cetak hasil ranking sebagai PDF.
+     */
+    public function cetakPdf(Request $request)
+    {
+        $semester = $request->query('semester');
+
+        $hasil = HasilSpk::with('siswa')
+            ->when($semester, fn ($q) => $q->where('semester', $semester))
+            ->orderBy('ranking')
+            ->get();
+
+        $pdf = Pdf::loadView('spk.pdf', compact('hasil', 'semester'))
+            ->setPaper('a4', 'landscape');
+
+        return $pdf->stream('laporan-spk-siswa-terbaik.pdf');
+    }
+}
+
